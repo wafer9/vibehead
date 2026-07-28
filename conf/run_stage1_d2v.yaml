@@ -1,0 +1,59 @@
+## model_args
+stage: 0
+
+temporal_model: /nfs-speech-cfs/wangzhou/.cache/models/Qwen3-1.7B-Base # Qwen2.5-7B-Instruct
+vibevoice_path: /nfs-speech-cfs/wangzhou/.cache/models/VibeVoice-1.5B
+
+tokenizer_config:
+    chat_template: /nfs-speech-cfs/wangzhou/.cache/models/Qwen2.5-7B-Instruct/chat_template.jinja
+
+
+dataset_conf:
+    filter_conf:
+        max_length: 30 # second
+        min_length: 0.5
+        token_max_length: 500 # 5min * 200
+        token_min_length: 1
+    shuffle: true
+    shuffle_conf:
+        shuffle_size: 1500
+    sort: false
+    sort_conf:
+        sort_size: 1000  # sort_size should be less than shuffle_size
+    batch_conf:
+        batch_type: 'static' # static or dynamic
+        batch_size: 8
+        # max_frames_in_batch: 3000
+    is_inference: false
+    chat: False
+    shard_latent: true
+    spk_sim_thresh: 0.7
+
+grad_clip: 1
+accum_grad: 2
+max_epoch: 5
+log_interval: 100
+optim_conf:
+    lr: 0.001 # 0.000005 # 0.0000001 0.00005 0.00001
+scheduler_conf:
+    warmup_steps: 5000
+dtype: bf16
+
+freeze_diffusion_head: false
+
+# CFG uncond 条件类型：
+#   'prev' = 上一帧 connect feature(in-distribution null)
+#   'zero' = 全 0(OOD null)
+#   'conv' = 因果卷积弱模型(单遍，有声学上下文、无文本)
+#   'ori'  = 真两遍：训练时额外跑一遍无文本 LLM，用其 hidden 作 uncond(推理用 generate_cfg_ori)
+uncond_type: conv
+conv_kernel_size: 4
+# init_checkpoint: /nfs-speech-cfs/wangzhou/s2s/TwinLakes_cfg/exp/vibe_base_cfg_conv/1_160000.pt
+
+use_spk_emb: false
+spk_emb_dim: 256                       # 可选，默认 256
+# spk_emb_checkpoint: /path/to/wavlm_large_finetune.pth   # 仅推理用
+
+run_name: "vibe_qwen3_1p7b_conv_4"
+use_semantic: false
+input_feat: acoustic
