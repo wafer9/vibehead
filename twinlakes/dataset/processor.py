@@ -24,11 +24,6 @@ import random
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import torchaudio
-import torchaudio.compliance.kaldi as kaldi
-import torch.nn.functional as F
-import whisper
-import re
-from typing import List, Dict, Union
 from twinlakes.utils.mask import make_pad_mask
 import math
 import base64
@@ -38,11 +33,14 @@ try:
     torchaudio.utils.sox_utils.set_buffer_size(16500)
 except AttributeError:
     pass
+from decord import VideoReader, cpu
+import os
 
 AUDIO_FORMAT_SETS = set(['flac', 'mp3', 'm4a', 'ogg', 'opus', 'wav', 'wma'])
 from vibevoice.processor.vibevoice_processor import AudioNormalizer
 audio_normalizer = AudioNormalizer()
 SAMPLE_RATE=24000
+_AUDIO_BACKEND = os.environ.get("AUDIO_BACKEND", "soundfile")
 
 logging.getLogger('langid').setLevel(logging.INFO)
 
@@ -166,85 +164,6 @@ def decode_wav(sample, max_per_line=None):
             'text': texts[tgt_idx],
         }
 
-def decode_wav_single(sample, max_per_line=None):
-    """ Parse a json line holding a list of clips from one speaker and expand
-        it into multiple training samples.
-
-        Each chosen clip is used once as the target (wav + text); its voice
-        prompt is another randomly picked clip from the same list. Only the
-        clips actually used (targets + their prompts) are decoded, once each,
-        so per-line IO / json parse is amortized without wasting decode CPU.
-
-        Args:
-            sample: dict with 'key' and 'text' (a json line carrying wavs/texts)
-            max_per_line: cap on how many target samples to emit per line; None
-                means use every clip as a target.
-
-        Yields:
-            {key, wav, prompt_wav, sample_rate, text}
-    """
-    assert 'key' in sample
-    assert 'text' in sample
-
-    obj = json.loads(sample['text'])
-    key = obj['id']
-    text = obj['text']
-    wav = obj['wav']
-    prompt_wav = obj['prompt_wav']
-
-    with io.BytesIO(base64.b64decode(wav)) as file_obj:
-        waveform, sample_rate = torchaudio.load(file_obj)
-        if sample_rate != SAMPLE_RATE:
-            waveform = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)(waveform)
-    wav = waveform
-
-    with io.BytesIO(base64.b64decode(prompt_wav)) as file_obj:
-        waveform, sample_rate = torchaudio.load(file_obj)
-        if sample_rate != SAMPLE_RATE:
-            waveform = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)(waveform)
-    prompt_wav = waveform
-
-    sample = dict(key=key, wav=wav, text=text, prompt_wav=prompt_wav, sample_rate=SAMPLE_RATE)
-
-    return sample
-
-
-def decode_latent_single(sample, max_per_line=None):
-    """新 latent shard：每个 .text 是 json，含 base64(np.save, fp16) 的 VAE latent，
-    直接解码成张量,免去在线 encode。
-
-    产出的 'wav'/'prompt_wav' 是 **latent** 张量 [T, vae_dim](不是音频),并置 is_latent=True，
-    下游 tokenize/filter/padding/forward 会据此走 latent 分支(长度按帧数而非采样数)。
-    """
-    assert 'key' in sample
-    assert 'text' in sample
-    obj = json.loads(sample['text'])
-
-    def _lat(b64):
-        arr = np.load(io.BytesIO(base64.b64decode(b64)))     # [T, vae_dim], fp16
-        return torch.from_numpy(np.ascontiguousarray(arr)).float()
-
-    tts_latent = _lat(obj['tts_latent'])                     # [T, 64]
-    prompt_latent = _lat(obj['prompt_latent'])               # [Tp, 64]
-
-    # target 的 semantic latent [T,128]（shard 里预存则直读，训练用作 target wav 的语义条件）。
-    # 帧数 T 与 tts_latent 对齐；缺失(旧 shard)则为 None。
-    semantic = _lat(obj['semantic_latent']) if 'semantic_latent' in obj else None
-
-    # prompt 段声纹(WavLM-ECAPA 256-d)：既用于 filter 的相似度清洗，也作 diffusion head 的说话人条件。
-    spk_sim = obj['sim']
-    spk_emb = None
-    # if 'prompt_emb' in obj:
-    #     spk_emb = _lat(obj['prompt_emb']).flatten()          # [256] prompt 段声纹
-    # if 'tts_emb' in obj and spk_emb is not None:
-    #     e1 = _lat(obj['tts_emb']).flatten()                  # [256] 目标段声纹
-    #     spk_sim = torch.nn.functional.cosine_similarity(e1, spk_emb, dim=0).item()
-
-    return dict(key=obj['id'], text=obj['text'],
-                wav=tts_latent, prompt_wav=prompt_latent, semantic=semantic,
-                is_latent=True, spk_sim=spk_sim, spk_emb=spk_emb, sample_rate=SAMPLE_RATE,
-                prompt_text=obj['prompt_text'])
-
 
 def decode_wav_raw(sample, resample=24000):
     """ Parse key/wav/txt from json line
@@ -256,135 +175,106 @@ def decode_wav_raw(sample, resample=24000):
             {key, wav, sample_rate, ...}
     """
     assert 'key' in sample
-    assert 'text' in sample
 
-    waveform, sample_rate = torchaudio.load(sample['prompt_wav'])
-    if sample_rate != resample:
-        waveform = torchaudio.transforms.Resample(sample_rate, resample)(waveform)
-        sample_rate = resample
-    sample['prompt_wav'] = waveform
-
-    if 'wav' in sample:
-        waveform, sample_rate = torchaudio.load(sample['wav'])
-        if sample_rate != resample:
-            waveform = torchaudio.transforms.Resample(sample_rate, resample)(waveform)
-            sample_rate = resample
-        sample['wav'] = waveform
-    else:
-        sample['wav'] = torch.empty(1, 0)
-        sample_rate = resample
-
+    waveform, sample_rate = torchaudio.load(sample['audio'], backend=_AUDIO_BACKEND)
+    if sample_rate != SAMPLE_RATE:
+        waveform = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)(waveform)
+        sample_rate = SAMPLE_RATE
+    assert sample_rate == resample
+    sample['wav'] = waveform[:1]
     sample['sample_rate'] = sample_rate
-    sample['text'] = sample['text']
+
+    vr = VideoReader(sample['video'], ctx=cpu(0), num_threads=8)
+    
+    frames = vr.get_batch(list(range(len(vr)))).asnumpy() # 读取全部视频帧：[T, H, W, C]，RGB uint8
+    fps = float(vr.get_avg_fps())
+
+    frames = torch.from_numpy(frames)
+    frames = frames.permute(0, 3, 1, 2).float() # [T, H, W, C] -> [T, C, H, W]
+    frames = frames / 127.5 - 1.0 # [0, 255] -> [-1, 1]
+    video = frames.permute(1, 0, 2, 3).contiguous() # [T, C, H, W] -> [C, T, H, W]
+
+    sample['video'] = video
+    sample['fps'] = fps
     return sample
+
+def filter(sample, fps_diff_thresh=1):
+    flag = True
+    sample_rate = sample['sample_rate']
+    fps = sample['fps']
+    if abs(sample['video'].shape[1] - int(sample['wav'].shape[1]/sample_rate*fps)) > fps_diff_thresh:
+        flag = False
+    return flag
 
 
 def sort_by_feats(sample):
-    assert 'input_ids' in sample
-    return sample['input_ids'].size(0)
+    return sample['video'].shape[1]
 
 
-def tokenize(sample, tokenizer, is_inference=False, cfg_rate=0.0):
+def tokenize(sample, tokenizer):
     speech_tok_compress_ratio = 3200
-    is_latent = sample.get('is_latent', False)
-    if is_latent:
-        # latent 已是 [T, vae_dim]，vae token 数 = 帧数 = shape[0]
-        prompt_vae_tok_len = sample['prompt_wav'].shape[0]
-    else:
-        prompt_vae_tok_len = math.ceil(sample['prompt_wav'].shape[1] / speech_tok_compress_ratio)
-    prompt = " Voice input:\n<|vision_start|>%s<|vision_end|>\n Text input:\n%s\n Speech output:\n<|vision_start|>" \
-                % ("<|vision_pad|>"*prompt_vae_tok_len, sample['text'])
+    prompt = " Reference image:<|image_pad|>\n Video output:\n<|vision_start|>"
+
+    # 1. 计算原始 token 数
+    vae_audio_tok_len = math.ceil(sample['wav'].shape[1] / speech_tok_compress_ratio)
+    vae_video_tok_len = 1 + (sample['video'].shape[1] - 1) // 4
+
+    # 2. 各自能凑出多少个完整 chunk, 取较小值(木桶原理)
+    num_chunks = min(vae_audio_tok_len // 6, vae_video_tok_len // 5)
+
+    # 3. 根据公共 chunk 数, 反算对齐后的 token 数
+    audio_tok_clipped = num_chunks * 6
+    video_tok_clipped = num_chunks * 5
+
+    # 4. 裁剪音频和视频
+    sample['wav'] = sample['wav'][:, :audio_tok_clipped * speech_tok_compress_ratio]
+    sample['video'] = sample['video'][:, :(video_tok_clipped - 1) * 4 + 1, :, :]
+
+    # 5. 校验对齐
+    assert math.ceil(sample['wav'].shape[1] / speech_tok_compress_ratio) == audio_tok_clipped
+    assert 1 + (sample['video'].shape[1] - 1) // 4 == video_tok_clipped
+    assert audio_tok_clipped // 6 == video_tok_clipped // 5 == num_chunks
+
     
-    # alpha = random.random()
-    # if alpha > cfg_rate:
-    #     prompt = " Voice input:\n<|vision_start|>%s<|vision_end|>\n Text input:\n%s\n Speech output:\n<|vision_start|>" \
-    #             % ("<|vision_pad|>"*prompt_vae_tok_len, sample['text'])
-    # else:
-    #     prompt = " Speech output:\n<|vision_start|>"
-    
-    if is_latent:
-        vae_tok_len = sample['wav'].shape[0] if sample['wav'].numel() > 0 else 0
-    else:
-        vae_tok_len = math.ceil(sample['wav'].shape[1] / speech_tok_compress_ratio)
-    label = "<|vision_pad|>"*vae_tok_len + "<|endoftext|>"
+    label = ""
+    for i in range(num_chunks):
+        label += "<|vision_pad|>" * 6 + "<|vision_end|>" * 5
+    label += "<|endoftext|>"
 
     prompt, label = [prompt], [label]
 
-
-    if is_inference:
-        encoding = tokenizer(text=prompt,
-                        text_target=label,
-                        padding=True,
+    encoding = tokenizer(
+                        text=prompt,
+                        text_pair=label,
+                        add_special_tokens=True,
+                        padding=True,  # truncation
                         return_tensors="pt",
+                        return_token_type_ids=True,
                         return_attention_mask=True)
-    else:
-        encoding = tokenizer(
-                            text=prompt,
-                            text_pair=label,
-                            add_special_tokens=True,
-                            padding=True,  # truncation
-                            return_tensors="pt",
-                            return_token_type_ids=True,
-                            return_attention_mask=True)
-        token_type_ids = encoding["token_type_ids"]
-        sample['labels'] = encoding["input_ids"].clone()
-        sample["labels"][token_type_ids == 0] = -100
+    token_type_ids = encoding["token_type_ids"]
+    sample['labels'] = encoding["input_ids"].clone()
+    sample["labels"][token_type_ids == 0] = -100
     prompt, label = prompt[0], label[0]
 
     sample['input_ids'] = encoding["input_ids"]
 
     start_pos = torch.where(encoding["input_ids"] == tokenizer.speech_start_id)
-    end_pos = torch.where(encoding["input_ids"] == tokenizer.speech_end_id)
     eos_pos = torch.where(encoding["input_ids"] == tokenizer.eos_id)
-    if start_pos[0].shape[0] == 2:
-        audio_pos = torch.stack((start_pos[1][0], end_pos[1][0], start_pos[1][1], eos_pos[1][0]), dim=0)
-    else:
-        audio_pos = torch.stack((start_pos[1][0], eos_pos[1][0]), dim=0)
+    video_pos = torch.stack((start_pos[1][0], eos_pos[1][0]), dim=0)
 
-    if is_latent:
-        # latent 直接透传 [T, vae_dim]，不做 audio_normalizer
-        prompt_wav = sample['prompt_wav']
-        wav = sample['wav']
-    else:
-        prompt_wav = torch.from_numpy(audio_normalizer(sample['prompt_wav'][0].numpy())).unsqueeze(0)
-        wav = torch.from_numpy(audio_normalizer(sample['wav'][0].numpy())).unsqueeze(0) if sample['wav'].shape[1] > 0 else sample['wav']
+    wav = torch.from_numpy(audio_normalizer(sample['wav'][0].numpy())).unsqueeze(0)
     batch = {
         "key": sample['key'],
         "prompt": prompt,
         "label": label,
         "input_ids": sample['input_ids'][0],
         "label_ids": sample["labels"][0] if 'labels' in sample else torch.zeros([1, 0]),
-        "prompt_wav": prompt_wav,
         "wav": wav,
-        "audio_pos": audio_pos,
-        "is_latent": is_latent,
-        "spk_sim": sample.get('spk_sim', None),
-        "spk_emb": sample.get('spk_emb', None),      # [256] prompt 段声纹，作 diffusion head 说话人条件
-        "semantic": sample.get('semantic', None),    # [T,128] target 预存 semantic latent(仅 latent shard)
-        "text": sample['text'],
-        "prompt_text": sample['prompt_text']
+        "video_pos": video_pos,
+        "video": sample['video'],
+        "num_chunks": num_chunks,
     }
     return batch
-
-
-def filter(sample, spk_sim_thresh=0.7):
-    flag = True
-    if sample['wav'] is not None:
-        if sample.get('is_latent', False):
-            # latent [T, vae_dim]，按帧数过滤(7.5Hz)：30s≈225 帧，0.5s≈4 帧
-            T = sample['wav'].shape[0]
-            if T > 30 * 8 or (0 < T < 4):
-                flag = False
-        else:
-            if sample['wav'].shape[1] > 30*24000 or ( 0 < sample['wav'].shape[1] < 0.5*24000):
-                flag = False
-    # 声纹相似度过滤：prompt 与当前 wav 说话人相似度 < 阈值则丢弃(有 spk_sim 时生效)
-    spk_sim = sample.get('spk_sim', None)
-    if spk_sim is not None and (spk_sim < spk_sim_thresh or spk_sim > 0.98):
-        flag = False
-    if sample['text'] == sample['prompt_text']:
-        flag = False
-    return flag
 
 
 def padding(data, ):
@@ -395,63 +285,35 @@ def padding(data, ):
     order = torch.argsort(input_ids_length, descending=True)
 
     keys = [sample[i]['key'] for i in order]
-    is_latent = sample[0].get('is_latent', False)
-    if is_latent:
-        # latent [T, vae_dim]：沿帧维(dim0)pad，长度=帧数；不 transpose
-        prompt_wavs = [sample[i]['prompt_wav'] for i in order]
-        wavs = [sample[i]['wav'] for i in order]
-        prompt_wavs_lengths = torch.tensor([sample[i]['prompt_wav'].size(0) for i in order],
-                                     dtype=torch.int32)
-        wavs_lengths = torch.tensor([sample[i]['wav'].size(0) for i in order],
-                                     dtype=torch.int32)
-    else:
-        prompt_wavs = [sample[i]['prompt_wav'].transpose(0,1) for i in order]
-        wavs = [sample[i]['wav'].transpose(0,1) for i in order]
-        prompt_wavs_lengths = torch.tensor([sample[i]['prompt_wav'].size(1) for i in order],
-                                     dtype=torch.int32)
-        wavs_lengths = torch.tensor([sample[i]['wav'].size(1) for i in order],
-                                     dtype=torch.int32)
+    wavs = [sample[i]['wav'].transpose(0,1) for i in order]
+
+    videos = [sample[i]['video'].transpose(0,1) for i in order]
 
     input_ids = [sample[i]['input_ids'] for i in order]
     label_ids = [sample[i]['label_ids'] for i in order]
 
-    padded_prompt_wavs = pad_sequence(prompt_wavs, batch_first=True, padding_value=0)
     padded_wavs = pad_sequence(wavs, batch_first=True, padding_value=0)
+    wavs_lengths = torch.tensor([sample[i]['wav'].size(1) for i in order], dtype=torch.int32)
+
+    padded_videos = pad_sequence(videos, batch_first=True, padding_value=0)
+    videos_lengths = torch.tensor([sample[i]['video'].size(1) for i in order], dtype=torch.int32)
+    
     
     input_ids = pad_sequence(input_ids, batch_first=True, padding_value=-100)
     label_ids = pad_sequence(label_ids, batch_first=True, padding_value=-100)
     
-    audio_pos = [sample[i]['audio_pos'] for i in order]
+    video_pos = [sample[i]['video_pos'] for i in order]
 
-    # prompt 段声纹 [B, spk_dim]，作 diffusion head 的说话人条件；缺失(无 emb 的样本)补零。
-    SPK_DIM = 256
-    spk_list = [sample[i].get('spk_emb', None) for i in order]
-    if any(e is not None for e in spk_list):
-        _dim = next(e.numel() for e in spk_list if e is not None)
-        spk_embs = torch.stack(
-            [e.float() if e is not None else torch.zeros(_dim) for e in spk_list], dim=0)
-    else:
-        spk_embs = torch.zeros(len(order), SPK_DIM)
-
-    # target 预存 semantic latent [B, Tmax, 128]，沿帧维(dim0)pad，与 wavs 帧对齐(同 wavs_lengths)。
-    # 仅 latent shard 且样本带 semantic 时构建；否则为 None(wav 输入走在线抽取)。
-    sem_list = [sample[i].get('semantic', None) for i in order]
-    if all(e is not None for e in sem_list):
-        semantic_latents = pad_sequence(sem_list, batch_first=True, padding_value=0)
-    else:
-        semantic_latents = None
 
     batch = {
         "keys": keys,
-        "prompt_wavs": padded_prompt_wavs,
-        "wavs": padded_wavs,
         "input_ids": input_ids,
         "label_ids":label_ids,
-        "prompt_wavs_lengths": prompt_wavs_lengths,
+        "wavs": padded_wavs,
         "wavs_lengths": wavs_lengths,
-        "audio_pos": audio_pos,
-        "spk_embs": spk_embs,
-        "semantic_latents": semantic_latents,
+        "video_pos": video_pos,
+        "videos": padded_videos,
+        "videos_lengths": videos_lengths,
     }
     return batch
 
