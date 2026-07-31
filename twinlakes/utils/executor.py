@@ -26,7 +26,6 @@ from twinlakes.utils.common import StepTimer
 from twinlakes.utils.train_utils import log_per_step, wenet_join
 from torch.nn.utils import clip_grad_norm_
 from twinlakes.utils.checkpoint import save_checkpoint, save_state_dict_and_infos
-from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
 
 class Executor:
 
@@ -81,21 +80,12 @@ class Executor:
                 if wenet_join(group_join, info_dict):
                     break
                 
-                prompt_wavs = batch_dict['prompt_wavs'].to(device=self.device, dtype=dtype)
+
                 wavs = batch_dict['wavs'].to(self.device, dtype=dtype)
-                prompt_wavs_lengths = batch_dict['prompt_wavs_lengths'].to(device=self.device)
                 wavs_lengths = batch_dict['wavs_lengths'].to(device=self.device)
 
-                # prompt 段声纹 [B, spk_dim]，作 diffusion head 说话人条件(use_spk_emb 时生效)
-                spk_embs = batch_dict.get('spk_embs', None)
-                if spk_embs is not None:
-                    spk_embs = spk_embs.to(device=self.device, dtype=dtype)
-                # target 预存 semantic latent [B,T,128](仅 latent shard；wav 输入时为 None，forward 在线抽)
-                semantic_latents = batch_dict.get('semantic_latents', None)
-                if semantic_latents is not None:
-                    semantic_latents = semantic_latents.to(device=self.device, dtype=dtype)
-
-                # text_ids = batch_dict['text_ids'].to(self.device)
+                videos = batch_dict['videos'].to(self.device, dtype=dtype)
+                videos_lengths = batch_dict['videos_lengths'].to(device=self.device)
 
                 input_ids = batch_dict['input_ids'].to(self.device)
                 labels = batch_dict['label_ids'].to(self.device)
@@ -116,48 +106,20 @@ class Executor:
                     context = nullcontext
                 
                 with context():
-                    if train_engine == "deepspeed":
-                        
-                        with torch.cuda.amp.autocast(enabled=dtype is not None,
-                                     dtype=dtype,
-                                     cache_enabled=False):
-                            loss_dict = model(
-                                      keys=batch_dict['keys'],
-                                      input_ids=input_ids,
-                                      labels=labels,
-                                      prompt_wavs=prompt_wavs,
-                                      wavs=wavs,
-                                      prompt_wavs_lengths=prompt_wavs_lengths,
-                                      wavs_lengths=wavs_lengths,
-                                      audio_pos=batch_dict['audio_pos'],
-                                      spk_embs=spk_embs,
-                                      semantic_latents=semantic_latents,
-                            )
-                    else:
-                        loss_dict = model(
-                                    keys=batch_dict['keys'],
-                                      input_ids=input_ids,
-                                      labels=labels,
-                                      prompt_wavs=prompt_wavs,
-                                      wavs=wavs,
-                                      prompt_wavs_lengths=prompt_wavs_lengths,
-                                      wavs_lengths=wavs_lengths,
-                                      audio_pos=batch_dict['audio_pos'],
-                                      spk_embs=spk_embs,
-                                      semantic_latents=semantic_latents,
-                        )
+                    loss_dict = model(
+                                keys=batch_dict['keys'],
+                                input_ids=input_ids,
+                                labels=labels,
+                                wavs=wavs,
+                                wavs_lengths=wavs_lengths,
+                                audio_pos=batch_dict['video_pos'],
+                                videos=videos,
+                                videos_lengths=videos_lengths,
+                    )
                     info_dict['loss_dict'] = loss_dict
                     loss = info_dict['loss_dict']['loss']
-                if train_engine == 'deepspeed':
-                    loss = model.backward(loss)
-                else:
-                    loss.backward()
-                if train_engine == 'deepspeed':
-                    info_dict["is_gradient_accumulation_boundary"] = \
-                        model.is_gradient_accumulation_boundary()
-                    model.step()
-                    grad_norm = model.get_global_grad_norm()
-                elif (batch_idx + 1) % accum_grad == 0:
+                loss.backward()
+                if (batch_idx + 1) % accum_grad == 0:
                     grad_norm = clip_grad_norm_(model.parameters(), clip)
                     if torch.isfinite(grad_norm):
                         optimizer.step()
@@ -174,8 +136,6 @@ class Executor:
                 log_per_step(writer, info_dict, timer=self.train_step_timer)
 
                 if self.step % 5000 == 0 and self.step // 5000 > 0:
-                    if configs['train_engine'] == "deepspeed":
-                        model.save_checkpoint(save_dir=configs['model_dir'], tag="train")
                     if rank == 0:
                         save_model_path = os.path.join(configs['model_dir'], '{}_{}.pt'.format(configs['epoch'], self.step))
                         infos_ = {
@@ -184,13 +144,7 @@ class Executor:
                                     'step': self.step,
                                     'save_time': datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
                                 }
-                        if train_engine == "deepspeed":
-                            state_dict = get_fp32_state_dict_from_zero_checkpoint(configs['model_dir'], "train",
-                                                                                exclude_frozen_parameters=False
-                                                                                )
-                            save_state_dict_and_infos(state_dict, save_model_path, infos_)
-                        else:
-                            save_checkpoint(model, save_model_path, infos_)
+                        save_checkpoint(model, save_model_path, infos_)
                 self.step += 1
 
 
@@ -218,21 +172,12 @@ class Executor:
                 info_dict["batch_idx"] = batch_idx
                 info_dict["cv_step"] = batch_idx
 
-                prompt_wavs = batch_dict['prompt_wavs'].to(device=self.device, dtype=dtype)
+
                 wavs = batch_dict['wavs'].to(self.device, dtype=dtype)
-                prompt_wavs_lengths = batch_dict['prompt_wavs_lengths'].to(device=self.device)
                 wavs_lengths = batch_dict['wavs_lengths'].to(device=self.device)
 
-                # prompt 段声纹 [B, spk_dim]，作 diffusion head 说话人条件(use_spk_emb 时生效)
-                spk_embs = batch_dict.get('spk_embs', None)
-                if spk_embs is not None:
-                    spk_embs = spk_embs.to(device=self.device, dtype=dtype)
-                # target 预存 semantic latent [B,T,128](仅 latent shard；wav 输入时为 None，forward 在线抽)
-                semantic_latents = batch_dict.get('semantic_latents', None)
-                if semantic_latents is not None:
-                    semantic_latents = semantic_latents.to(device=self.device, dtype=dtype)
-
-                # text_ids = batch_dict['text_ids'].to(self.device)
+                videos = batch_dict['videos'].to(self.device, dtype=dtype)
+                videos_lengths = batch_dict['videos_lengths'].to(device=self.device)
 
                 input_ids = batch_dict['input_ids'].to(self.device)
                 labels = batch_dict['label_ids'].to(self.device)
@@ -248,13 +193,11 @@ class Executor:
                                 keys=batch_dict['keys'],
                                 input_ids=input_ids,
                                 labels=labels,
-                                prompt_wavs=prompt_wavs,
                                 wavs=wavs,
-                                prompt_wavs_lengths=prompt_wavs_lengths,
                                 wavs_lengths=wavs_lengths,
-                                audio_pos=batch_dict['audio_pos'],
-                                spk_embs=spk_embs,
-                                semantic_latents=semantic_latents,
+                                audio_pos=batch_dict['video_pos'],
+                                videos=videos,
+                                videos_lengths=videos_lengths,
                 )
                 total_loss += loss_dict['loss'].item() * num_utts
                 # info_dict['loss_dict'] = loss_dict

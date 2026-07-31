@@ -64,26 +64,10 @@ def Dataset(data_type,
                                              shuffle=list_shuffle,
                                              shuffle_size=list_shuffle_size,
                                              cycle=cycle)
-        # shard_latent=True：新 shard 直接存 VAE latent(免在线 encode)；False：旧 shard 存音频
-        if conf.get('shard_latent', False):
-            dataset = dataset.map_ignore_error(processor.decode_latent_single)
-        else:
-            dataset = dataset.map_ignore_error(processor.decode_wav_single)
+        dataset = dataset.map_ignore_error(processor.decode_wav)
 
-
-    # fbank_conf = conf.get('fbank_conf', {})
-    # dataset = dataset.map(partial(processor.compute_whisper_fbank, 
-    #                             n_mels=fbank_conf['num_mel_bins']))
-    
-    cfg_rate = conf.get('cfg_rate', 0.0)
-    is_inference = conf.get('is_inference', False)
-    dataset = dataset.map(partial(processor.tokenize, 
-                                  tokenizer=tokenizer, 
-                                  is_inference=is_inference,
-                                  cfg_rate=cfg_rate))
-
-    spk_sim_thresh = conf.get('spk_sim_thresh', 0.8)   # 声纹相似度过滤阈值(latent shard 生效)
-    dataset = dataset.filter(partial(processor.filter, spk_sim_thresh=spk_sim_thresh))
+    dataset = dataset.filter(partial(processor.filter))
+    dataset = dataset.map(partial(processor.tokenize, tokenizer=tokenizer))
 
     shuffle = conf.get('shuffle', True)
     if shuffle:

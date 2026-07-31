@@ -35,6 +35,8 @@ from vibevoice.modular.modular_vibevoice_diffusion_head import VibeVoiceDiffusio
 from vibevoice.schedule.dpm_solver import DPMSolverMultistepScheduler
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modular_vibevoice_tokenizer import VibeVoiceTokenizerStreamingCache
+from twinlakes.vae.wan import WanVAE
+
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,48 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
     seq_length_expand = lengths.unsqueeze(-1)
     mask = seq_range_expand >= seq_length_expand
     return mask
+
+
+class WanLatentCompressorQFormer(nn.Module):
+    """(B, 16, T, 64, 64) -> (B, T, 1024), 用1个query抽取整帧"""
+    def __init__(self, in_ch=16, hidden=512, out_dim=1024, num_heads=8):
+        super().__init__()
+        self.in_proj = nn.Linear(in_ch, hidden)
+        self.pos_embed = nn.Parameter(torch.randn(1, 64 * 64, hidden) * 0.02)
+        self.query = nn.Parameter(torch.randn(1, 1, hidden) * 0.02)
+        self.attn = nn.MultiheadAttention(hidden, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden)
+        self.out_proj = nn.Linear(hidden, out_dim)
+
+    def forward(self, x):                          # (B, C, T, H, W)
+        B, C, T, H, W = x.shape
+        x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)  # (B*T, 4096, 16)
+        x = self.in_proj(x) + self.pos_embed       # (B*T, 4096, hidden)
+        q = self.query.expand(B * T, -1, -1)       # (B*T, 1, hidden)
+        out, _ = self.attn(q, x, x)                # (B*T, 1, hidden)
+        out = self.out_proj(self.norm(out))        # (B*T, 1, out_dim)
+        return out.reshape(B, T, -1)               # (B, T, out_dim)
+
+
+class WanLatentDecompressorQFormer(nn.Module):
+    """(B, T, 1024) -> (B, 16, T, 64, 64)"""
+    def __init__(self, out_ch=16, hidden=512, in_dim=1024, num_heads=8):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, hidden)
+        # 64*64 个 learnable 空间 query 作为重建位置
+        self.spatial_query = nn.Parameter(torch.randn(1, 64 * 64, hidden) * 0.02)
+        self.attn = nn.MultiheadAttention(hidden, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden)
+        self.out_proj = nn.Linear(hidden, out_ch)
+
+    def forward(self, x):                          # (B, T, D)
+        B, T, D = x.shape
+        cond = self.in_proj(x).reshape(B * T, 1, -1)  # (B*T, 1, hidden) 作为 KV
+        q = self.spatial_query.expand(B * T, -1, -1)  # (B*T, 4096, hidden)
+        out, _ = self.attn(q, cond, cond)          # (B*T, 4096, hidden)
+        out = self.out_proj(self.norm(out))        # (B*T, 4096, 16)
+        out = out.reshape(B, T, 64, 64, -1).permute(0, 4, 1, 2, 3)  # (B,16,T,64,64)
+        return out
 
 
 class LMMConfig(PretrainedConfig):
@@ -130,6 +174,8 @@ class LMModel(nn.Module):
         speech_scaling_factor: Optional[torch.tensor] = None,
         speech_bias_factor: Optional[torch.tensor] = None,
         diffusion_head_proj: Optional[torch.nn.Linear] = None,
+        vae: Optional[WanVAE] = None,
+        dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
         super().__init__()
@@ -147,7 +193,12 @@ class LMModel(nn.Module):
 
         self.lm_head = torch.nn.Linear(self.lm.config.hidden_size, 2)
 
-        self.to(torch.bfloat16)
+        self.vae =vae
+
+        self.comp = WanLatentCompressorQFormer(out_dim=self.lm.config.hidden_size)
+        self.decomp = WanLatentDecompressorQFormer(in_dim=self.lm.config.hidden_size)
+
+        self.to(dtype=dtype)
 
 
     @classmethod
@@ -166,6 +217,12 @@ class LMModel(nn.Module):
         vibevoice = VibeVoiceForConditionalGenerationInference.from_pretrained(configs['vibevoice_path'])
         acoustic_tokenizer = vibevoice.model.acoustic_tokenizer
         acoustic_connector = SpeechConnector(acoustic_tokenizer.config.vae_dim, lm_config.hidden_size)
+
+        if configs['dtype'] == 'bf16':
+            dtype=torch.bfloat16
+        else:
+            dtype=torch.float32
+        vae = WanVAE(vae_path=configs['vae_path'], dtype=dtype)
 
 
         if configs['freeze_diffusion_head']:
@@ -193,6 +250,8 @@ class LMModel(nn.Module):
                     speech_scaling_factor=vibevoice.speech_scaling_factor,
                     speech_bias_factor=vibevoice.speech_bias_factor,
                     diffusion_head_proj=diffusion_head_proj,
+                    vae=vae,
+                    dtype=dtype,
                     )
         return model
     
@@ -221,59 +280,56 @@ class LMModel(nn.Module):
                 keys: List[str],
                 input_ids: torch.Tensor,
                 labels: torch.Tensor,
-                prompt_wavs: torch.Tensor,
                 wavs: torch.Tensor,
-                prompt_wavs_lengths: torch.Tensor,
                 wavs_lengths: torch.Tensor,
                 audio_pos: List[torch.Tensor],
+                videos: torch.Tensor,
+                videos_lengths: torch.Tensor,
                 ):
 
         B, T  = input_ids.shape
         mask = (0 <= input_ids) & (input_ids < self.lm.vocab_size)
         x = self.lm.get_input_embeddings()(torch.masked_fill(input_ids, ~mask, self.tokenizer.eos_id))
 
-
-        prompt_speech_masks = ~make_pad_mask(torch.ceil(prompt_wavs_lengths/3200).to(dtype=torch.int64))
-        prompt_speech_features = self.acoustic_tokenizer.encode(prompt_wavs.transpose(1,2)).mean
-        prompt_speech_features = (prompt_speech_features + self.speech_bias_factor) * self.speech_scaling_factor
-        prompt_speech_connect_features = self.acoustic_connector(prompt_speech_features)
-
-
-        speech_masks = ~make_pad_mask(torch.ceil(wavs_lengths/3200).to(dtype=torch.int64))
+        # 有效长度（去 padding 后的帧数）
+        speech_valid_len = torch.ceil(wavs_lengths / 3200).to(torch.int64)
+        video_valid_len = 1 + (videos_lengths - 1) // 4
+        
+        # 音频特征
+        speech_masks = ~make_pad_mask(speech_valid_len.to(dtype=torch.int64))
         speech_features = self.acoustic_tokenizer.encode(wavs.transpose(1,2)).mean
         speech_features = (speech_features + self.speech_bias_factor) * self.speech_scaling_factor
-        speech_connect_features = self.acoustic_connector(speech_features)
+        speech_features = self.acoustic_connector(speech_features)
+
+        # 视频特征
+        videos_masks = ~make_pad_mask(video_valid_len.to(dtype=torch.int64))
+        with torch.no_grad():
+            videos_latent = self.vae.encode(videos.transpose(1, 2))
+        videos_features = self.comp(videos_latent)
 
 
-
-        prompt_wav_pad_mask = torch.zeros_like(input_ids)
-        wav_pad_mask = torch.zeros_like(input_ids)
-        wav_loss_mask = torch.zeros_like(input_ids)
+        audio_pad_mask = torch.zeros_like(input_ids)
+        video_pad_mask = torch.zeros_like(input_ids)
+        video_loss_mask = torch.zeros_like(input_ids)
 
         for idx in range(len(audio_pos)):
-            if audio_pos[idx].shape[0] == 4:
-                p_s, p_e, s, e = audio_pos[idx].tolist()
-                prompt_wav_pad_mask[idx, p_s+1:p_e] = 1
-                wav_pad_mask[idx, s+1:e] = 1
-                wav_loss_mask[idx, s:e-1] = 1 # 包括
-            elif audio_pos[idx].shape[0] == 2:
-                s, e = audio_pos[idx].tolist()
-                wav_pad_mask[idx, s+1:e] = 1
-                wav_loss_mask[idx, s:e-1] = 1
-                prompt_speech_masks[idx] = 0
+            s, e = audio_pos[idx].tolist()
+            for n in range(speech_valid_len):
+                audio_pad_mask[idx, s + 1 + n * 11 : s + 1 + n * 11 + 6] = 1
+                video_pad_mask[idx, s + 1 + n * 11 + 6 : s + 1 + n * 11 + 11] = 1
+                video_loss_mask[idx, s + 1 + n * 11 + 6 -1 : s + 1 + n * 11 + 11 -1] = 1
 
         
-        prompt_wav_pad_mask = prompt_wav_pad_mask.bool()
         wav_pad_mask = wav_pad_mask.bool()
         wav_loss_mask = wav_loss_mask.bool()
+        video_loss_mask = video_loss_mask.bool()
 
-
-        x[prompt_wav_pad_mask] = prompt_speech_connect_features[prompt_speech_masks] # prompt 恒为声学
-        x[wav_pad_mask] = speech_connect_features[speech_masks]                           # 只声学(基线)
+        x[audio_pad_mask] = speech_features[speech_masks] # audio
+        x[video_pad_mask] = videos_features[videos_masks] # video
 
 
         # cond 计算text loss
-        cond_outputs = self.lm(inputs_embeds=x,
+        outputs = self.lm(inputs_embeds=x,
                             past_key_values=None,
                             attention_mask=None,
                             labels=None,
@@ -282,67 +338,55 @@ class LMModel(nn.Module):
                             output_hidden_states=True,
                             return_dict=True)
 
-        con_hidden_states = cond_outputs.hidden_states[-1]
-        logits = self.lm_head(con_hidden_states)
-
-        loss_text = None
-        if labels is not None:
-            labels[labels==self.tokenizer.speech_diffusion_id] = 0
-            labels[labels==self.tokenizer.eos_id] = 1
-            labels = labels.to(logits.device)
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            loss_text = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        hidden_states = outputs.hidden_states[-1]
 
 
         # --- Diffusion Loss Calculation ---
         ddpm_batch_mul = 1
         diffusion_loss = None
-        speech_features = speech_features[speech_masks]
+        video_features = videos_features[videos_masks]
         # This block is executed only if we are in a context that involves speech.
         if wav_loss_mask.sum().item() > 0:
-            condition_features = con_hidden_states[wav_loss_mask]
+            condition_features = hidden_states[wav_loss_mask]
 
 
-
-            speech_len, latent_size = speech_features.shape
+            video_len, latent_size = video_features.shape
             
             noise = torch.randn(
-                (speech_len * ddpm_batch_mul, latent_size),
+                (video_len * ddpm_batch_mul, latent_size),
                 device=condition_features.device, dtype=condition_features.dtype
             )
             
             timesteps = torch.multinomial(
                 torch.ones(self.config.diffusion_head_config.ddpm_num_steps),
-                speech_len * ddpm_batch_mul,
+                video_len * ddpm_batch_mul,
                 replacement=True,
-            ).to(con_hidden_states.device)
+            ).to(hidden_states.device)
 
-            speech_features_repeated = speech_features.repeat_interleave(ddpm_batch_mul, dim=0)
+            video_features_repeated = video_features.repeat_interleave(ddpm_batch_mul, dim=0)
             condition_features_repeated = condition_features.repeat_interleave(ddpm_batch_mul, dim=0)
 
-            noisy_speech_features = self.noise_scheduler.add_noise(
-                speech_features_repeated, noise, timesteps
+            noisy_video_features = self.noise_scheduler.add_noise(
+                video_features_repeated, noise, timesteps
             )
             
-            model_output = self.diffusion_head(noisy_speech_features,  timesteps.type_as(x),  condition_features_repeated)
+            model_output = self.diffusion_head(noisy_video_features,  timesteps.type_as(x),  condition_features_repeated)
 
-            target_for_loss = self.noise_scheduler.get_velocity(speech_features_repeated, noise, timesteps)
+            target_for_loss = self.noise_scheduler.get_velocity(video_features_repeated, noise, timesteps)
 
-            diffusion_loss = torch.nn.functional.mse_loss(model_output.float(), target_for_loss.float(), reduction='sum')/speech_len
+            diffusion_loss = torch.nn.functional.mse_loss(model_output.float(), target_for_loss.float(), reduction='sum')/video_len
 
         else:
-            # Dummy loss for DDP to work when there are no speech samples in a batch,
-            # but we are in a speech context.
+            # Dummy loss for DDP to work when there are no video samples in a batch,
+            # but we are in a video context.
             diffusion_loss = sum(p.sum() for p in self.diffusion_head.parameters()) * 0.0
             diffusion_loss += sum(p.sum() for p in self.acoustic_connector.parameters()) * 0.0
 
         # --- End Diffusion Loss Calculation ---
 
-        loss = loss_text + diffusion_loss
+        loss = diffusion_loss
 
-        return {"loss": loss, "loss_text": loss_text, "diffusion_loss": diffusion_loss}
+        return {"loss": loss, "diffusion_loss": diffusion_loss}
 
 
 

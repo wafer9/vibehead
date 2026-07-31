@@ -1,12 +1,12 @@
 ## model_args
 stage: 0
 
-temporal_model: /nfs-speech-cfs/wangzhou/.cache/models/Qwen3-1.7B-Base # Qwen2.5-7B-Instruct
+temporal_model: /nfs-speech-cfs/wangzhou/.cache/models/Qwen3-0.6B-Base # Qwen2.5-7B-Instruct
 vibevoice_path: /nfs-speech-cfs/wangzhou/.cache/models/VibeVoice-1.5B
 
 tokenizer_config:
     chat_template: /nfs-speech-cfs/wangzhou/.cache/models/Qwen2.5-7B-Instruct/chat_template.jinja
-
+vae_path: /nfs-speech-cfs/wangzhou/tts/SoulX-FlashHead/models/SoulX-FlashHead-1_3B/VAE_Wan/Wan2.1_VAE.pth
 
 dataset_conf:
     filter_conf:
@@ -14,12 +14,12 @@ dataset_conf:
         min_length: 0.5
         token_max_length: 500 # 5min * 200
         token_min_length: 1
-    shuffle: true
+    shuffle: false
     shuffle_conf:
-        shuffle_size: 1500
+        shuffle_size: 100
     sort: false
     sort_conf:
-        sort_size: 1000  # sort_size should be less than shuffle_size
+        sort_size: 50  # sort_size should be less than shuffle_size
     batch_conf:
         batch_type: 'static' # static or dynamic
         batch_size: 8

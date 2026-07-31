@@ -8,23 +8,13 @@ import torch
 import yaml
 import copy
 import json
-import deepspeed
-from deepspeed.runtime.zero.stage_1_and_2 import (
-    estimate_zero2_model_states_mem_needs_all_live)
-from deepspeed.runtime.zero.stage3 import (
-    estimate_zero3_model_states_mem_needs_all_live)
-from deepspeed.utils.zero_to_fp32 import (
-    convert_zero_checkpoint_to_fp32_state_dict,
-    get_fp32_state_dict_from_zero_checkpoint)
 
 import torch.distributed as dist
 
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from twinlakes.utils.executor import Executor
-# from twinlakes.models.rq_transformer import LMModel
 
-from safetensors.torch import load_model
 
 from twinlakes.dataset.dataset import Dataset
 from torch.utils.data import DataLoader
@@ -38,10 +28,6 @@ from twinlakes.utils.train_utils import send_dingtalk, check_modify_and_save_con
 
 def get_args():
     parser = argparse.ArgumentParser(description='training your network')
-    parser.add_argument('--train_engine',
-                        default='torch_ddp',
-                        choices=['torch_ddp', 'deepspeed'],
-                        help='Engine for paralleled training')
     parser.add_argument('--config', required=True, help='config file')
     parser.add_argument('--model_dir', required=True, help='save model dir')
     parser.add_argument('--data_type',
@@ -79,22 +65,12 @@ def get_args():
                         type=int,
                         help='timeout (in seconds) of wenet_join. ' +
                         '30s for aishell & 300s for wenetspeech')
-    parser.add_argument('--deepspeed.save_states',
-                        dest='save_states',
-                        default='model_only',
-                        choices=['model_only', 'model+optimizer'],
-                        help='save model/optimizer states')
-    parser = deepspeed.add_config_arguments(parser)
-    # DeepSpeed automaticly add '--deepspeed' and '--deepspeed_config' to parser
     parser.add_argument('--local-rank',
                         type=int,
                         default=-1,
                         help='local rank passed from distributed launcher')
 
     args = parser.parse_args()
-    if args.train_engine == "deepspeed":
-        args.deepspeed = True
-        assert args.deepspeed_config is not None
     return args
 
 
@@ -114,23 +90,6 @@ def main():
         configs = yaml.load(fin, Loader=yaml.FullLoader)
     from twinlakes.models.rq_transformer import LMModel
     model = LMModel.from_audio_text_pretrained(configs)
-    def _load_weights(m, path, skip_uncond_conv=False):
-        """strict=False 载入权重，返回 sidecar .yaml 的 infos。
-        skip_uncond_conv=True 时丢弃 checkpoint 里所有 uncond_conv.* → uncond_conv 保持随机初始化。
-        """
-        import re as _re
-        sd = torch.load(path, map_location='cpu')
-        if skip_uncond_conv:
-            sd = {kk: vv for kk, vv in sd.items() if not kk.startswith('uncond_conv.')}
-        miss, unexp = m.load_state_dict(sd, strict=False)
-        print('[load] %s | skip_uncond=%s missing=%d unexpected=%d'
-              % (path, skip_uncond_conv, len(miss), len(unexp)), flush=True)
-        info_path = _re.sub(r'\.pt$', '.yaml', path)
-        _infos = {}
-        if os.path.exists(info_path):
-            with open(info_path) as _f:
-                _infos = yaml.load(_f, Loader=yaml.FullLoader) or {}
-        return _infos
 
     checkpoints = glob(os.path.join(args.model_dir + '/*.pt'))
     if checkpoints:
@@ -143,17 +102,10 @@ def main():
             except ValueError:
                 return os.path.getmtime(p)                 # 兜底：按写入时间
         checkpoints = sorted(checkpoints, key=_ckpt_step)
-        infos = _load_weights(model, checkpoints[-1])     # resume 本 run：全部加载(含 uncond_conv)
+        infos = load_checkpoint(model, checkpoints[-1])     # resume 本 run：全部加载(含 uncond_conv)
         print('[resume] loaded checkpoint:', checkpoints[-1], flush=True)
     else:
         infos = {}
-        # 全新 run 且指定了 init_checkpoint：热启动(权重 only)。
-        # uncond_conv 随机初始化(默认 skip)，其余(LLM/connector/head)从 checkpoint 加载。
-        init_ckpt = configs.get('init_checkpoint', None)
-        if init_ckpt:
-            _load_weights(model, init_ckpt,
-                          skip_uncond_conv=configs.get('init_skip_uncond_conv', True))
-            print('[init] warm-start from', init_ckpt, flush=True)
 
     def _freeze_params(module):
         for param in module.parameters():
@@ -163,22 +115,18 @@ def main():
     # _freeze_params(model.lm)
     if configs['freeze_diffusion_head']:
         _freeze_params(model.diffusion_head)
-
+    _freeze_params(model.vae.model)
 
 
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     rank = int(os.environ.get('RANK', 0))
 
-    if args.train_engine == "torch_ddp":
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(args.dist_backend)
-    elif args.train_engine == "deepspeed":
-        deepspeed.init_distributed(dist_backend=args.dist_backend)
-    else:
-        logging.error("not supported engine: {}".format(args.train_engine))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(args.dist_backend)
 
-    configs = check_modify_and_save_config(args, configs)
+    device = torch.device(f"cuda:{local_rank}")
+    
 
 
     train_conf = configs['dataset_conf']
@@ -238,53 +186,15 @@ def main():
             fout.write(data)
 
 
-    if args.train_engine == "torch_ddp":
-        model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, find_unused_parameters=True)
-        device = torch.device("cuda")
-        device = int(os.environ.get('LOCAL_RANK', 0))
-    elif args.train_engine == "deepspeed":
-        local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
-        if int(os.environ.get('RANK', 0)) == 0:
-            logging.info("Estimating model states memory needs (zero2)...")
-            estimate_zero2_model_states_mem_needs_all_live(
-                model,
-                num_gpus_per_node=local_world_size,
-                num_nodes=world_size // local_world_size)
-            logging.info("Estimating model states memory needs (zero3)...")
-            estimate_zero3_model_states_mem_needs_all_live(
-                model,
-                num_gpus_per_node=local_world_size,
-                num_nodes=world_size // local_world_size)
-        device = int(os.environ.get('LOCAL_RANK', 0))
-    else:
-        logging.error("not supported engine: {}".format(args.train_engine))
+    model = model.to(device)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, 
+        device_ids=[local_rank], output_device=local_rank,
+        find_unused_parameters=True)
 
 
     optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
     scheduler = WarmupLR(optimizer, **configs['scheduler_conf'])
-    if args.train_engine == "deepspeed":
-        with open(args.deepspeed_config, 'r') as fin:
-            ds_configs = json.load(fin)
-        if "optimizer" in ds_configs:
-            # NOTE(xcsong): Disable custom optimizer if it is set in ds_config,
-            # extremely useful when enable cpu_offload, DeepspeedCpuAdam
-            # could be 4~5x faster than torch native adam
-            optimizer = None
-            if "scheduler" in ds_configs:
-                scheduler = None
-            else:
-
-                def scheduler(opt):
-                    return WarmupLR(opt, **configs['scheduler_conf'])
-
-        model, optimizer, _, scheduler = deepspeed.initialize(
-            args=args,
-            model=model,
-            optimizer=optimizer,
-            lr_scheduler=scheduler,
-            model_parameters=model.parameters())
 
     executor = Executor(device=device, runname=configs['run_name'])
 
@@ -297,7 +207,6 @@ def main():
 
     for epoch in range(start_epoch, num_epochs):
         configs['epoch'] = epoch
-        configs['train_engine'] = args.train_engine
         lr = optimizer.param_groups[0]['lr']
         if rank == 0:
             logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
@@ -311,10 +220,6 @@ def main():
         dist.destroy_process_group(group_join)
         dist.barrier() # Ensure all ranks start CV at the same time.
         loss = executor.cv(model, cv_data_loader, writer, configs)
-        # loss = 0
-        tag = 'train'
-        if args.train_engine == "deepspeed":
-            model.save_checkpoint(save_dir=args.model_dir, tag=tag)
 
         if rank == 0:
             logging.info('Epoch {} CV info lr {} cv_loss {}'.format(epoch, lr, loss))
@@ -326,17 +231,7 @@ def main():
                         'step': executor.step,
                         'save_time': datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S'),
                     }
-            if args.train_engine == "deepspeed":
-                state_dict = get_fp32_state_dict_from_zero_checkpoint(args.model_dir, tag,
-                                                                    exclude_frozen_parameters=False
-                                                                    )
-                for key in state_dict.keys():
-                    if 'mimi' in key:
-                        print(key)
-                save_state_dict_and_infos(state_dict, save_model_path, infos_)
-                os.system("rm -rf {}/{}".format(args.model_dir, tag))
-            else:
-                save_checkpoint(model, save_model_path, infos_)
+            save_checkpoint(model, save_model_path, infos_)
             send_dingtalk(configs['run_name'], epoch, executor.step, loss, lr)
 
 

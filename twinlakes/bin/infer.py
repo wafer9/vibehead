@@ -17,6 +17,11 @@ import imageio
 from tqdm import tqdm
 
 from twinlakes.vae.wan import WanVAE
+import json
+import torchaudio
+import math
+import os
+_AUDIO_BACKEND = os.environ.get("AUDIO_BACKEND", "soundfile")
 
 vae_path = "/nfs-speech-cfs/wangzhou/tts/SoulX-FlashHead/models/SoulX-FlashHead-1_3B/VAE_Wan/Wan2.1_VAE.pth"
 video_path = "/nfs-speech-cfs/wangzhou/tts/SoulX-FlashTalk/sample_results_batch/00000003_58a866e17fc0561876faa159e2a6fbf75d2227a8995d13c93bb52f04f6ce8377_0.mp4"
@@ -24,15 +29,16 @@ video_path = "/nfs-speech-cfs/wangzhou/tts/SoulX-FlashTalk/sample_results_batch/
 vae = WanVAE(
     vae_path=vae_path,
     dtype=torch.bfloat16,
-    device="cuda:0",
+    device="cuda:7",
     parallel=False,
 )
+# print(vae.model)
 
 
 
 def read_full_video(
     video_path,
-    device="cuda",
+    device="cuda:7",
     dtype=torch.bfloat16,
 ):
     vr = VideoReader(
@@ -106,34 +112,55 @@ def save_video_tensor(video, output_path, fps=25):
 #         print(video.shape, fps, flush=True)   # THWC: (T, H, W, 3) 或 TCHW: (T, 3, H, W)
 #         t += video.shape[2]/fps
 # print(t)
+SAMPLE_RATE = 24000
+with open('data/vivi/train.list', 'r') as f:
+    for line in tqdm(f.readlines()[:100]):
+        obj = json.loads(line.strip())
+        video_path = obj['video']
+        video = read_full_video(video_path)
+        x = vae.encode(video[0])
+        assert 1 + (video[0].shape[2]-1)//4 == x.shape[1]
+        # video_r = vae.decode(x)
+        # print(x.shape)
+
+        waveform, sample_rate = torchaudio.load(obj['audio'], backend=_AUDIO_BACKEND)
+        waveform = waveform[:1]
+        if sample_rate != SAMPLE_RATE:
+            waveform = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)(waveform)
+        
+        if waveform.shape[1] / SAMPLE_RATE * 25 > video[0].shape[2]:
+            waveform = waveform[:, : int(video[0].shape[2]/25 * SAMPLE_RATE)]
+        else:
+            diff_len = int(video[0].shape[2] / 25 * SAMPLE_RATE) - waveform.shape[1]
+            waveform = torch.cat([waveform, torch.zeros(1, diff_len)], dim=1)
+        
+        audio_token = math.ceil(waveform.shape[1] / 3200)
+
+        print(video[0].shape, audio_token , x.shape[1]%5, audio_token%6, flush=True)
 
 
-# x = vae.encode(video)
-# video_r = vae.decode(x)
-# print(x.shape)
-# print(video_r.shape)
 # save_video_tensor(video=video_r, output_path="/nfs-speech-cfs/wangzhou/s2s/vibehead/1.mp4")
 
 
-from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
-import torchaudio
-vibevoice = VibeVoiceForConditionalGenerationInference.from_pretrained("/nfs-speech-cfs/wangzhou/.cache/models/VibeVoice-1.5B")
-acoustic_tokenizer = vibevoice.model.acoustic_tokenizer
-acoustic_tokenizer = acoustic_tokenizer.to(device="cuda:0")
-acoustic_tokenizer.eval()
+# from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
+# import torchaudio
+# vibevoice = VibeVoiceForConditionalGenerationInference.from_pretrained("/nfs-speech-cfs/wangzhou/.cache/models/VibeVoice-1.5B")
+# acoustic_tokenizer = vibevoice.model.acoustic_tokenizer
+# acoustic_tokenizer = acoustic_tokenizer.to(device="cuda:0")
+# acoustic_tokenizer.eval()
 
 
-import os
-_AUDIO_BACKEND = os.environ.get("AUDIO_BACKEND", "soundfile")
-audio, sr = torchaudio.load("/nfs-speech-cfs/wangzhou/data/tts/VividHead/audios/82565.wav", backend=_AUDIO_BACKEND)
+# import os
+# _AUDIO_BACKEND = os.environ.get("AUDIO_BACKEND", "soundfile")
+# audio, sr = torchaudio.load("/nfs-speech-cfs/wangzhou/data/tts/VividHead/audios/82565.wav", backend=_AUDIO_BACKEND)
 
-audio = audio[:1, :].unsqueeze(0)
-print(audio.shape, sr)
+# audio = audio[:1, :].unsqueeze(0)
+# print(audio.shape, sr)
 
-latent = acoustic_tokenizer.encode(audio.to(device="cuda:0")).mean
-print(latent.shape)
+# latent = acoustic_tokenizer.encode(audio.to(device="cuda:0")).mean
+# print(latent.shape)
 
-y = acoustic_tokenizer.decode(latent.to(acoustic_tokenizer.device))[0]  # 整条解码
-y = y.float().detach().cpu()
-print(y.shape)
-torchaudio.save('/nfs-speech-cfs/wangzhou/s2s/vibehead/1.wav', y, sample_rate=sr, backend=_AUDIO_BACKEND)
+# y = acoustic_tokenizer.decode(latent.to(acoustic_tokenizer.device))[0]  # 整条解码
+# y = y.float().detach().cpu()
+# print(y.shape)
+# torchaudio.save('/nfs-speech-cfs/wangzhou/s2s/vibehead/1.wav', y, sample_rate=sr, backend=_AUDIO_BACKEND)
