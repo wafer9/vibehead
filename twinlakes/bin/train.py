@@ -113,8 +113,8 @@ def main():
 
     _freeze_params(model.acoustic_tokenizer)
     # _freeze_params(model.lm)
-    if configs['freeze_diffusion_head']:
-        _freeze_params(model.diffusion_head)
+    if configs.get('freeze_video_dit', configs.get('freeze_diffusion_head', False)):
+        _freeze_params(model.video_dit)
     _freeze_params(model.vae.model)
 
 

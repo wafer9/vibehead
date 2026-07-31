@@ -29,6 +29,11 @@ def parse_args():
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument(
+        "--video-codec",
+        default="libopenh264",
+        help="ffmpeg video encoder (default: libopenh264; this build lacks libx264)",
+    )
     return parser.parse_args()
 
 
@@ -62,8 +67,11 @@ def run_ffmpeg(ffmpeg, input_path, output_path, extra_args, overwrite):
     try:
         command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
         command += ["-y" if overwrite else "-n", "-i", str(input_path)]
-        command += extra_args + [str(temporary)]
-        subprocess.run(command, check=True)
+        command += extra_args + ["-f", output_path.suffix.lstrip("."), str(temporary)]
+        result = subprocess.run(command, check=False, capture_output=True, text=True)
+        if result.returncode:
+            detail = (result.stderr or result.stdout or "ffmpeg returned no error details").strip()
+            raise RuntimeError(f"ffmpeg exited with status {result.returncode}: {detail}")
         os.replace(temporary, output_path)
     except Exception:
         try:
@@ -84,8 +92,13 @@ def process_record(record, args):
             args.ffmpeg,
             record["video"],
             video_output,
-            ["-map", "0:v:0", "-vf", "fps=30", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p"],
-            args.overwrite,
+            [
+                "-map", "0:v:0",
+                "-vf", "fps=30",
+                "-c:v", "libopenh264",
+                "-b:v", "800k",        # libopenh264 用码率控制，替代 -q:v
+                "-pix_fmt", "yuv420p",
+            ],
         )
         completed.append("video")
     if args.overwrite or not audio_output.exists():

@@ -8,33 +8,21 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
-from functools import partial
 import logging
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
-import torch.nn.functional as F
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 from transformers import PretrainedConfig, PreTrainedModel
-from typing import Optional
-from typing import Optional, Dict, List
-from torch.nn import CrossEntropyLoss
-import torchaudio
-
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-import copy
-import torch.distributed as dist
 
 from vibevoice.modular.modeling_vibevoice import SpeechConnector
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
-from vibevoice.modular.modular_vibevoice_diffusion_head import VibeVoiceDiffusionHead
 from vibevoice.schedule.dpm_solver import DPMSolverMultistepScheduler
 from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
-from vibevoice.modular.modular_vibevoice_tokenizer import VibeVoiceTokenizerStreamingCache
+from twinlakes.models.video_dit import VideoDiT, VideoDiTConfig
 from twinlakes.vae.wan import WanVAE
 
 
@@ -89,27 +77,6 @@ class WanLatentCompressorQFormer(nn.Module):
         out, _ = self.attn(q, x, x)                # (B*T, 1, hidden)
         out = self.out_proj(self.norm(out))        # (B*T, 1, out_dim)
         return out.reshape(B, T, -1)               # (B, T, out_dim)
-
-
-class WanLatentDecompressorQFormer(nn.Module):
-    """(B, T, 1024) -> (B, 16, T, 64, 64)"""
-    def __init__(self, out_ch=16, hidden=512, in_dim=1024, num_heads=8):
-        super().__init__()
-        self.in_proj = nn.Linear(in_dim, hidden)
-        # 64*64 个 learnable 空间 query 作为重建位置
-        self.spatial_query = nn.Parameter(torch.randn(1, 64 * 64, hidden) * 0.02)
-        self.attn = nn.MultiheadAttention(hidden, num_heads, batch_first=True)
-        self.norm = nn.LayerNorm(hidden)
-        self.out_proj = nn.Linear(hidden, out_ch)
-
-    def forward(self, x):                          # (B, T, D)
-        B, T, D = x.shape
-        cond = self.in_proj(x).reshape(B * T, 1, -1)  # (B*T, 1, hidden) 作为 KV
-        q = self.spatial_query.expand(B * T, -1, -1)  # (B*T, 4096, hidden)
-        out, _ = self.attn(q, cond, cond)          # (B*T, 4096, hidden)
-        out = self.out_proj(self.norm(out))        # (B*T, 4096, 16)
-        out = out.reshape(B, T, 64, 64, -1).permute(0, 4, 1, 2, 3)  # (B,16,T,64,64)
-        return out
 
 
 class LMMConfig(PretrainedConfig):
@@ -168,12 +135,11 @@ class LMModel(nn.Module):
         language_model: Optional[PreTrainedModel] = None,
         acoustic_tokenizer: Optional[PreTrainedModel] = None,
         acoustic_connector: Optional[SpeechConnector] = None,
-        diffusion_head: Optional[VibeVoiceDiffusionHead] = None,
+        video_dit: Optional[VideoDiT] = None,
         noise_scheduler: Optional[DPMSolverMultistepScheduler] = None,
         tokenizer: Optional[AutoTokenizer] = None,
         speech_scaling_factor: Optional[torch.tensor] = None,
         speech_bias_factor: Optional[torch.tensor] = None,
-        diffusion_head_proj: Optional[torch.nn.Linear] = None,
         vae: Optional[WanVAE] = None,
         dtype: Optional[torch.dtype] = None,
         **kwargs,
@@ -183,8 +149,7 @@ class LMModel(nn.Module):
         self.lm = language_model
         self.acoustic_tokenizer = acoustic_tokenizer
         self.acoustic_connector = acoustic_connector
-        self.diffusion_head = diffusion_head
-        self.diffusion_head_proj = diffusion_head_proj
+        self.video_dit = video_dit
         self.noise_scheduler = noise_scheduler
         self.tokenizer = tokenizer
 
@@ -193,10 +158,9 @@ class LMModel(nn.Module):
 
         self.lm_head = torch.nn.Linear(self.lm.config.hidden_size, 2)
 
-        self.vae =vae
+        self.vae = vae
 
         self.comp = WanLatentCompressorQFormer(out_dim=self.lm.config.hidden_size)
-        self.decomp = WanLatentDecompressorQFormer(in_dim=self.lm.config.hidden_size)
 
         self.to(dtype=dtype)
 
@@ -225,14 +189,11 @@ class LMModel(nn.Module):
         vae = WanVAE(vae_path=configs['vae_path'], dtype=dtype)
 
 
-        if configs['freeze_diffusion_head']:
-            diffusion_head = vibevoice.prediction_head
-        else:
-            diffusion_head_config = copy.deepcopy(vibevoice.config.diffusion_head_config)
-            diffusion_head_config.hidden_size = lm_config.hidden_size
-            diffusion_head = AutoModel.from_config(diffusion_head_config)
-
-        diffusion_head_proj = None
+        video_dit_config = VideoDiTConfig.from_dict(
+            configs.get('video_dit_conf'),
+            llm_hidden_size=lm_config.hidden_size,
+        )
+        video_dit = VideoDiT(video_dit_config)
         noise_scheduler = DPMSolverMultistepScheduler(
             num_train_timesteps=vibevoice.config.diffusion_head_config.ddpm_num_steps,
             beta_schedule=vibevoice.config.diffusion_head_config.ddpm_beta_schedule,
@@ -244,12 +205,11 @@ class LMModel(nn.Module):
                     language_model=language_model,
                     acoustic_tokenizer=acoustic_tokenizer,
                     acoustic_connector=acoustic_connector,
-                    diffusion_head=diffusion_head,
+                    video_dit=video_dit,
                     noise_scheduler=noise_scheduler,
                     tokenizer=tokenizer,
                     speech_scaling_factor=vibevoice.speech_scaling_factor,
                     speech_bias_factor=vibevoice.speech_bias_factor,
-                    diffusion_head_proj=diffusion_head_proj,
                     vae=vae,
                     dtype=dtype,
                     )
@@ -286,49 +246,73 @@ class LMModel(nn.Module):
                 videos: torch.Tensor,
                 videos_lengths: torch.Tensor,
                 ):
-
-        B, T  = input_ids.shape
+        batch_size, _ = input_ids.shape
         mask = (0 <= input_ids) & (input_ids < self.lm.vocab_size)
         x = self.lm.get_input_embeddings()(torch.masked_fill(input_ids, ~mask, self.tokenizer.eos_id))
 
-        # 有效长度（去 padding 后的帧数）
+        # Audio and 30 FPS video latents are both 7.5 Hz: 24000/3200 == 30/4.
         speech_valid_len = torch.ceil(wavs_lengths / 3200).to(torch.int64)
-        video_valid_len = 1 + (videos_lengths - 1) // 4
-        
-        # 音频特征
-        speech_masks = ~make_pad_mask(speech_valid_len.to(dtype=torch.int64))
+        video_valid_len = 1 + (videos_lengths.to(torch.int64) - 1) // 4
+
         speech_features = self.acoustic_tokenizer.encode(wavs.transpose(1,2)).mean
         speech_features = (speech_features + self.speech_bias_factor) * self.speech_scaling_factor
         speech_features = self.acoustic_connector(speech_features)
 
-        # 视频特征
-        videos_masks = ~make_pad_mask(video_valid_len.to(dtype=torch.int64))
         with torch.no_grad():
             videos_latent = self.vae.encode(videos.transpose(1, 2))
-        videos_features = self.comp(videos_latent)
+        if videos_latent.ndim == 4:
+            videos_latent = videos_latent.unsqueeze(0)
+        if videos_latent.ndim != 5 or videos_latent.shape[0] != batch_size:
+            raise ValueError(
+                "Wan VAE must return [B, 16, T, H, W], got "
+                f"{tuple(videos_latent.shape)}"
+            )
+        if videos_latent.shape[2] < 2:
+            raise ValueError("video must contain a reference latent and at least one target latent")
 
+        # The first causal Wan latent is the identity reference. Future latents
+        # are teacher-forced into the LLM one step after their prediction state.
+        reference_latent = videos_latent[:, :, :1]
+        target_latent = videos_latent[:, :, 1:]
+        target_frames = target_latent.shape[2]
+        target_valid_len = (video_valid_len - 1).clamp(min=0, max=target_frames)
+        video_features = self.comp(target_latent)
 
-        audio_pad_mask = torch.zeros_like(input_ids)
-        video_pad_mask = torch.zeros_like(input_ids)
-        video_loss_mask = torch.zeros_like(input_ids)
+        video_positions = []
+        for index, positions in enumerate(audio_pos):
+            positions = positions.tolist()
+            if len(positions) == 4:
+                prompt_start, prompt_end, video_start, video_end = positions
+                audio_count = min(
+                    int(speech_valid_len[index]),
+                    prompt_end - prompt_start - 1,
+                    speech_features.shape[1],
+                )
+                if audio_count > 0:
+                    x[index, prompt_start + 1:prompt_start + 1 + audio_count] = (
+                        speech_features[index, :audio_count].to(x.dtype)
+                    )
+            elif len(positions) == 2:
+                video_start, video_end = positions
+            else:
+                raise ValueError(
+                    f"audio_pos for {keys[index]} must contain 2 or 4 positions, "
+                    f"got {len(positions)}"
+                )
 
-        for idx in range(len(audio_pos)):
-            s, e = audio_pos[idx].tolist()
-            for n in range(speech_valid_len):
-                audio_pad_mask[idx, s + 1 + n * 11 : s + 1 + n * 11 + 6] = 1
-                video_pad_mask[idx, s + 1 + n * 11 + 6 : s + 1 + n * 11 + 11] = 1
-                video_loss_mask[idx, s + 1 + n * 11 + 6 -1 : s + 1 + n * 11 + 11 -1] = 1
+            video_count = int(target_valid_len[index])
+            available_positions = video_end - video_start - 1
+            if video_count > available_positions:
+                raise ValueError(
+                    f"{keys[index]} has {video_count} video latents but only "
+                    f"{available_positions} video placeholder positions"
+                )
+            if video_count > 0:
+                x[index, video_start + 1:video_start + 1 + video_count] = (
+                    video_features[index, :video_count].to(x.dtype)
+                )
+            video_positions.append((video_start, video_count))
 
-        
-        wav_pad_mask = wav_pad_mask.bool()
-        wav_loss_mask = wav_loss_mask.bool()
-        video_loss_mask = video_loss_mask.bool()
-
-        x[audio_pad_mask] = speech_features[speech_masks] # audio
-        x[video_pad_mask] = videos_features[videos_masks] # video
-
-
-        # cond 计算text loss
         outputs = self.lm(inputs_embeds=x,
                             past_key_values=None,
                             attention_mask=None,
@@ -339,166 +323,109 @@ class LMModel(nn.Module):
                             return_dict=True)
 
         hidden_states = outputs.hidden_states[-1]
+        h_video = hidden_states.new_zeros(
+            batch_size, target_frames, hidden_states.shape[-1]
+        )
+        for index, (video_start, video_count) in enumerate(video_positions):
+            if video_count > 0:
+                # h at position n predicts the clean video token inserted at n+1.
+                h_video[index, :video_count] = hidden_states[
+                    index, video_start:video_start + video_count
+                ]
 
+        if target_valid_len.sum().item() == 0:
+            diffusion_loss = sum(p.sum() for p in self.video_dit.parameters()) * 0.0
+            diffusion_loss += sum(p.sum() for p in self.comp.parameters()) * 0.0
+            return {"loss": diffusion_loss, "diffusion_loss": diffusion_loss}
 
-        # --- Diffusion Loss Calculation ---
-        ddpm_batch_mul = 1
-        diffusion_loss = None
-        video_features = videos_features[videos_masks]
-        # This block is executed only if we are in a context that involves speech.
-        if wav_loss_mask.sum().item() > 0:
-            condition_features = hidden_states[wav_loss_mask]
+        noise = torch.randn_like(target_latent)
+        timesteps = torch.randint(
+            0,
+            self.config.diffusion_head_config.ddpm_num_steps,
+            (batch_size,),
+            device=target_latent.device,
+        )
+        noisy_latent = self.noise_scheduler.add_noise(target_latent, noise, timesteps)
+        valid_mask = (
+            torch.arange(target_frames, device=target_latent.device)[None, :]
+            < target_valid_len[:, None]
+        )
+        model_output = self.video_dit(
+            noisy_latent=noisy_latent,
+            llm_condition=h_video,
+            reference=reference_latent,
+            timestep=timesteps,
+            frame_mask=valid_mask,
+        )
 
-
-            video_len, latent_size = video_features.shape
-            
-            noise = torch.randn(
-                (video_len * ddpm_batch_mul, latent_size),
-                device=condition_features.device, dtype=condition_features.dtype
+        prediction_type = self.config.diffusion_head_config.prediction_type
+        if prediction_type == "epsilon":
+            target_for_loss = noise
+        elif prediction_type == "v_prediction":
+            target_for_loss = self.noise_scheduler.get_velocity(
+                target_latent, noise, timesteps
             )
-            
-            timesteps = torch.multinomial(
-                torch.ones(self.config.diffusion_head_config.ddpm_num_steps),
-                video_len * ddpm_batch_mul,
-                replacement=True,
-            ).to(hidden_states.device)
-
-            video_features_repeated = video_features.repeat_interleave(ddpm_batch_mul, dim=0)
-            condition_features_repeated = condition_features.repeat_interleave(ddpm_batch_mul, dim=0)
-
-            noisy_video_features = self.noise_scheduler.add_noise(
-                video_features_repeated, noise, timesteps
-            )
-            
-            model_output = self.diffusion_head(noisy_video_features,  timesteps.type_as(x),  condition_features_repeated)
-
-            target_for_loss = self.noise_scheduler.get_velocity(video_features_repeated, noise, timesteps)
-
-            diffusion_loss = torch.nn.functional.mse_loss(model_output.float(), target_for_loss.float(), reduction='sum')/video_len
-
         else:
-            # Dummy loss for DDP to work when there are no video samples in a batch,
-            # but we are in a video context.
-            diffusion_loss = sum(p.sum() for p in self.diffusion_head.parameters()) * 0.0
-            diffusion_loss += sum(p.sum() for p in self.acoustic_connector.parameters()) * 0.0
+            raise NotImplementedError(f"unsupported prediction type: {prediction_type}")
 
-        # --- End Diffusion Loss Calculation ---
+        valid_mask = valid_mask[:, None, :, None, None]
+        squared_error = (model_output.float() - target_for_loss.float()).square()
+        squared_error = squared_error * valid_mask
+        elements_per_frame = (
+            target_latent.shape[1] * target_latent.shape[3] * target_latent.shape[4]
+        )
+        denominator = valid_mask.sum() * elements_per_frame
+        diffusion_loss = squared_error.sum() / denominator.clamp_min(1)
+        return {"loss": diffusion_loss, "diffusion_loss": diffusion_loss}
 
-        loss = diffusion_loss
-
-        return {"loss": loss, "diffusion_loss": diffusion_loss}
-
-
-
-    @torch.no_grad()
-    def generate_cfg_ori(self,
-                keys, prompt_wavs, prompt_wavs_lengths, input_ids, audio_pos, cfg_scale,
-                spk_emb=None
-                ):
-        B, T  = input_ids.shape
-        device = input_ids.device
-        mask = (0 <= input_ids) & (input_ids < self.lm.vocab_size)
-        x = self.lm.get_input_embeddings()(torch.masked_fill(input_ids, ~mask, self.tokenizer.eos_id))
-        negative_x = x[:, -4:, :]
-
-        prompt_speech_masks = ~make_pad_mask(torch.ceil(prompt_wavs_lengths/3200).to(dtype=torch.int64))
-        prompt_speech_features = self.acoustic_tokenizer.encode(prompt_wavs.transpose(1,2)).mean
-        prompt_speech_features = (prompt_speech_features + self.speech_bias_factor) * self.speech_scaling_factor
-        prompt_speech_connect_features = self.acoustic_connector(prompt_speech_features)
-
-        prompt_wav_pad_mask = torch.zeros_like(input_ids)
-        for idx in range(len(audio_pos)):
-            p_s, p_e, s = audio_pos[idx].tolist()
-            prompt_wav_pad_mask[idx, p_s+1:p_e] = 1
-
-        prompt_wav_pad_mask = prompt_wav_pad_mask.bool()
-        x[prompt_wav_pad_mask] = prompt_speech_connect_features[prompt_speech_masks] # 拼接 prompt wav
-
-        audios = []
-        past_key_values = None
-        negative_past_key_values = None
-        diffusion_indices = torch.arange(B, device=device)
-        acoustic_cache = VibeVoiceTokenizerStreamingCache()
-        semantic_cache = VibeVoiceTokenizerStreamingCache() if self.use_semantic else None
-
-        latents = []
-        n = 0
-        while True:
-            outputs = self.lm(inputs_embeds=x,
-                        past_key_values=past_key_values,
-                        attention_mask=None,
-                        labels=None,
-                        use_cache=None,
-                        output_attentions=None,
-                        output_hidden_states=True,
-                        return_dict=True)
-            negative_outputs = self.lm(inputs_embeds=negative_x,
-                        past_key_values=negative_past_key_values,
-                        attention_mask=None,
-                        labels=None,
-                        use_cache=None,
-                        output_attentions=None,
-                        output_hidden_states=True,
-                        return_dict=True)
-
-            past_key_values = outputs.past_key_values
-            hidden_states = outputs.hidden_states[-1][:, -1:, :]
-
-            logits = self.lm_head(hidden_states)
-            next_tokens = torch.argmax(logits, dim=-1)
-            if next_tokens[0] == 1:
-                break
-
-
-            negative_past_key_values = negative_outputs.past_key_values
-            negative_hidden_states = negative_outputs.hidden_states[-1][:, -1:, :]
-
-            speech_latent = self.sample_speech_tokens_cfg(hidden_states[0], negative_hidden_states[0], cfg_scale=cfg_scale, spk_emb=spk_emb).unsqueeze(1)
-            scaled_latent = speech_latent / self.speech_scaling_factor.to(speech_latent.device) - self.speech_bias_factor.to(speech_latent.device)
-            latents.append(scaled_latent)
-            
-            acoustic_embed = self.acoustic_connector(speech_latent)
-            x = acoustic_embed
-            negative_x = acoustic_embed
-
-            if n > 7.5*20:
-                break
-            n += 1
-
-        all_latent = torch.cat(latents, dim=1)
-        y = self.acoustic_tokenizer.decode(all_latent.to(self.acoustic_tokenizer.device))[0]  # 整条解码
-
-        return y.float().detach().cpu()
 
 
     @torch.no_grad()
-    def sample_speech_tokens_cfg(self, condition, neg_condition, cfg_scale=1.0,
-                                 spk_emb=None):
-
-        ddpm_inference_steps = 10
-        self.noise_scheduler.set_timesteps(ddpm_inference_steps)
-
-        # 说话人条件注入(与训练 forward 一致)：cond 拼真声纹、neg 拼全零，各自过 diffusion_head_proj。
-        if self.use_spk_emb and self.diffusion_head_proj is not None:
-            if spk_emb is None:
-                spk_emb = torch.zeros(condition.shape[0], self.spk_emb_dim,
-                                      device=condition.device, dtype=condition.dtype)
-            spk_emb = spk_emb.to(condition.dtype)
-            if spk_emb.shape[0] == 1 and condition.shape[0] > 1:
-                spk_emb = spk_emb.expand(condition.shape[0], -1)
-            condition = self.diffusion_head_proj(torch.cat([condition, spk_emb], dim=-1))
-            neg_condition = self.diffusion_head_proj(
-                torch.cat([neg_condition, torch.zeros_like(spk_emb)], dim=-1))
-
-        condition = torch.cat([condition, neg_condition], dim=0).to(self.diffusion_head.device)
-        speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
-        for t in self.noise_scheduler.timesteps:
-            half = speech[: len(speech) // 2]
-            combined = torch.cat([half, half], dim=0)
-            eps = self.diffusion_head(combined, t.repeat(combined.shape[0]).to(combined), condition=condition)
-            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-            eps = torch.cat([half_eps, half_eps], dim=0)
-            speech = self.noise_scheduler.step(eps, t, speech).prev_sample
-
-        return speech[: len(speech) // 2]
+    def sample_video_latents(
+        self,
+        llm_condition,
+        reference,
+        cfg_scale=1.0,
+        num_inference_steps=20,
+        generator=None,
+    ):
+        """Denoise a complete video-latent chunk from aligned LLM states."""
+        if llm_condition.ndim != 3:
+            raise ValueError("llm_condition must have shape [B, T, D]")
+        batch_size, frames, _ = llm_condition.shape
+        config = self.video_dit.config
+        latent = torch.randn(
+            batch_size,
+            config.latent_channels,
+            frames,
+            config.latent_height,
+            config.latent_width,
+            device=llm_condition.device,
+            dtype=llm_condition.dtype,
+            generator=generator,
+        )
+        self.noise_scheduler.set_timesteps(
+            num_inference_steps, device=llm_condition.device
+        )
+        for timestep in self.noise_scheduler.timesteps:
+            if cfg_scale == 1.0:
+                model_output = self.video_dit(
+                    latent, llm_condition, reference, timestep
+                )
+            else:
+                model_input = torch.cat([latent, latent], dim=0)
+                condition = torch.cat(
+                    [llm_condition, torch.zeros_like(llm_condition)], dim=0
+                )
+                reference_input = torch.cat([reference, reference], dim=0)
+                model_output = self.video_dit(
+                    model_input, condition, reference_input, timestep
+                )
+                conditional, unconditional = model_output.chunk(2, dim=0)
+                model_output = unconditional + cfg_scale * (
+                    conditional - unconditional
+                )
+            latent = self.noise_scheduler.step(
+                model_output, timestep, latent
+            ).prev_sample
+        return latent

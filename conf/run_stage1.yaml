@@ -39,7 +39,21 @@ scheduler_conf:
     warmup_steps: 5000
 dtype: bf16
 
-freeze_diffusion_head: false
+freeze_video_dit: false
+
+# Compact FlashHead-style VideoDiT (~55M parameters with Qwen3-0.6B).
+video_dit_conf:
+    latent_channels: 16
+    hidden_size: 512
+    num_heads: 8
+    num_layers: 10
+    ffn_dim: 2048
+    patch_size: [1, 4, 4]
+    context_tokens: 8
+    latent_height: 64
+    latent_width: 64
+    frequency_embedding_size: 256
+    norm_eps: 1.0e-6
 
 # CFG uncond 条件类型：
 #   'prev' = 上一帧 connect feature(in-distribution null)
